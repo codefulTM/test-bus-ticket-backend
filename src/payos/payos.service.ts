@@ -264,148 +264,222 @@ export class PayosService {
       this.logger.log(
         `Webhook received for order ${orderCode} with status ${success}`,
       );
+      this.logger.log(
+        `Webhook details - OrderCode: ${orderCode}, Amount: ${amount}, Code: ${code}, Description: ${desc || description}`,
+      );
 
       // Get payment record to find booking ID
-      const payment = await this.paymentRepository.findOne({
-        where: { payosOrderCode: orderCode },
-      });
+      let payment;
+      try {
+        payment = await this.paymentRepository.findOne({
+          where: { payosOrderCode: orderCode },
+        });
+        this.logger.log(`Payment record lookup for order ${orderCode}: ${payment ? 'FOUND' : 'NOT_FOUND'}`);
+      } catch (dbError) {
+        this.logger.error(`Database error when fetching payment record for order ${orderCode}:`, dbError);
+        return {
+          success: false,
+          message: 'Database error when fetching payment record',
+        };
+      }
 
       if (!payment) {
-        this.logger.warn(`No payment record found for order ${orderCode}`);
+        this.logger.warn(`No payment record found for order ${orderCode}. This might indicate an invalid order code or payment record deletion.`);
         return {
           success: false,
           message: 'Payment record not found',
         };
       }
 
+      this.logger.log(`Payment record found - ID: ${payment.id}, BookingID: ${payment.bookingId}, Current Status: ${payment.status}`);
+
       // Update payment status in database based on webhook success status
       const paymentStatus = success
         ? PaymentStatus.COMPLETED
         : PaymentStatus.FAILED;
 
-      await this.paymentRepository.update(
-        { payosOrderCode: orderCode },
-        { status: paymentStatus },
-      );
-
-      this.logger.log(
-        `Payment status updated to ${paymentStatus} in database for order ${orderCode}`,
-      );
+      try {
+        const updateResult = await this.paymentRepository.update(
+          { payosOrderCode: orderCode },
+          { status: paymentStatus },
+        );
+        this.logger.log(
+          `Payment status updated to ${paymentStatus} in database for order ${orderCode}. Affected rows: ${updateResult.affected || 0}`,
+        );
+      } catch (updateError) {
+        this.logger.error(`Failed to update payment status for order ${orderCode}:`, updateError);
+        return {
+          success: false,
+          message: 'Failed to update payment status',
+        };
+      }
 
       // Handle booking and seat status updates based on payment status
       if (payment.bookingId) {
+        this.logger.log(`Processing booking ${payment.bookingId} for payment ${success ? 'SUCCESS' : 'FAILURE'}`);
+        
         // Get seat information before updating for real-time notification
-        const seatStatuses = await this.seatStatusRepository.find({
-          where: { bookingId: payment.bookingId },
-          relations: ['trip'],
-        });
+        let seatStatuses;
+        try {
+          seatStatuses = await this.seatStatusRepository.find({
+            where: { bookingId: payment.bookingId },
+            relations: ['trip'],
+          });
+          this.logger.log(`Found ${seatStatuses.length} seat status records for booking ${payment.bookingId}`);
+        } catch (seatError) {
+          this.logger.error(`Failed to fetch seat statuses for booking ${payment.bookingId}:`, seatError);
+        }
 
         // Get booking information for booking gateway notifications
-        const booking = await this.bookingRepository.findOne({
-          where: { id: payment.bookingId },
-          relations: ['trip'],
-        });
+        let booking;
+        try {
+          booking = await this.bookingRepository.findOne({
+            where: { id: payment.bookingId },
+            relations: ['trip'],
+          });
+          this.logger.log(`Booking lookup for ${payment.bookingId}: ${booking ? 'FOUND' : 'NOT_FOUND'}`);
+        } catch (bookingError) {
+          this.logger.error(`Failed to fetch booking ${payment.bookingId}:`, bookingError);
+        }
 
         if (success) {
           // Payment successful - update booking to PAID and confirm seat bookings
-          await this.bookingRepository.update(
-            { id: payment.bookingId },
-            { status: BookingStatus.PAID },
-          );
-
-          this.logger.log(
-            `Booking status updated to PAID for booking ${payment.bookingId}`,
-          );
+          try {
+            const bookingUpdateResult = await this.bookingRepository.update(
+              { id: payment.bookingId },
+              { status: BookingStatus.PAID },
+            );
+            this.logger.log(
+              `Booking status updated to PAID for booking ${payment.bookingId}. Affected rows: ${bookingUpdateResult.affected || 0}`,
+            );
+          } catch (bookingUpdateError) {
+            this.logger.error(`Failed to update booking status to PAID for booking ${payment.bookingId}:`, bookingUpdateError);
+          }
 
           // Update seat statuses from LOCKED/RESERVED to BOOKED
-          await this.seatStatusRepository.update(
-            { bookingId: payment.bookingId },
-            {
-              state: SeatState.BOOKED,
-              lockedUntil: null, // Clear any lock timers
-            },
-          );
-
-          this.logger.log(
-            `Seat statuses updated to BOOKED for booking ${payment.bookingId}`,
-          );
+          try {
+            const seatUpdateResult = await this.seatStatusRepository.update(
+              { bookingId: payment.bookingId },
+              {
+                state: SeatState.BOOKED,
+                lockedUntil: null, // Clear any lock timers
+              },
+            );
+            this.logger.log(
+              `Seat statuses updated to BOOKED for booking ${payment.bookingId}. Affected rows: ${seatUpdateResult.affected || 0}`,
+            );
+          } catch (seatUpdateError) {
+            this.logger.error(`Failed to update seat statuses to BOOKED for booking ${payment.bookingId}:`, seatUpdateError);
+          }
 
           // Notify clients using BookingGateway for booking status change
           if (booking) {
-            this.bookingGateway.notifyBookingStatusChanged(
-              payment.bookingId,
-              BookingStatus.PAID,
-              {
-                paymentCompleted: true,
-                paymentMethod: 'payos',
-                transactionId: orderCode.toString(),
-              },
-            );
+            try {
+              this.bookingGateway.notifyBookingStatusChanged(
+                payment.bookingId,
+                BookingStatus.PAID,
+                {
+                  paymentCompleted: true,
+                  paymentMethod: 'payos',
+                  transactionId: orderCode.toString(),
+                },
+              );
+              this.logger.log(`Booking gateway notification sent for booking ${payment.bookingId} - PAID status`);
+            } catch (gatewayError) {
+              this.logger.error(`Failed to send booking gateway notification for booking ${payment.bookingId}:`, gatewayError);
+            }
+          } else {
+            this.logger.warn(`Skipping booking gateway notification - booking not found for ${payment.bookingId}`);
           }
 
           // Notify clients in real-time about seat booking confirmation
-          if (seatStatuses.length > 0) {
-            const tripId = seatStatuses[0].tripId;
-            const seatIds = seatStatuses.map((seat) => seat.seatId);
+          if (seatStatuses && seatStatuses.length > 0) {
+            try {
+              const tripId = seatStatuses[0].tripId;
+              const seatIds = seatStatuses.map((seat) => seat.seatId);
 
-            this.seatStatusGateway.notifySeatBooked(tripId, seatIds);
+              this.seatStatusGateway.notifySeatBooked(tripId, seatIds);
 
-            this.logger.log(
-              `Real-time notification sent for ${seatIds.length} seats now booked for trip ${tripId}`,
-            );
+              this.logger.log(
+                `Real-time notification sent for ${seatIds.length} seats now booked for trip ${tripId}`,
+              );
+            } catch (seatNotificationError) {
+              this.logger.error(`Failed to send seat booking notification for booking ${payment.bookingId}:`, seatNotificationError);
+            }
+          } else {
+            this.logger.warn(`Skipping seat booking notification - no seat statuses found for booking ${payment.bookingId}`);
           }
         } else {
           // Payment failed - release seats back to AVAILABLE
-          await this.bookingRepository.update(
-            { id: payment.bookingId },
-            {
-              status: BookingStatus.CANCELLED,
-              cancelledAt: new Date(),
-            },
-          );
-
-          this.logger.log(
-            `Booking status updated to CANCELLED for booking ${payment.bookingId} due to payment failure`,
-          );
+          try {
+            const bookingCancelResult = await this.bookingRepository.update(
+              { id: payment.bookingId },
+              {
+                status: BookingStatus.CANCELLED,
+                cancelledAt: new Date(),
+              },
+            );
+            this.logger.log(
+              `Booking status updated to CANCELLED for booking ${payment.bookingId} due to payment failure. Affected rows: ${bookingCancelResult.affected || 0}`,
+            );
+          } catch (bookingCancelError) {
+            this.logger.error(`Failed to cancel booking ${payment.bookingId}:`, bookingCancelError);
+          }
 
           // Release seats back to AVAILABLE status
-          await this.seatStatusRepository.update(
-            { bookingId: payment.bookingId },
-            {
-              state: SeatState.AVAILABLE,
-              bookingId: null,
-              lockedUntil: null,
-            },
-          );
-
-          this.logger.log(
-            `Seats released back to AVAILABLE for booking ${payment.bookingId} due to payment failure`,
-          );
+          try {
+            const seatReleaseResult = await this.seatStatusRepository.update(
+              { bookingId: payment.bookingId },
+              {
+                state: SeatState.AVAILABLE,
+                bookingId: null,
+                lockedUntil: null,
+              },
+            );
+            this.logger.log(
+              `Seats released back to AVAILABLE for booking ${payment.bookingId} due to payment failure. Affected rows: ${seatReleaseResult.affected || 0}`,
+            );
+          } catch (seatReleaseError) {
+            this.logger.error(`Failed to release seats for booking ${payment.bookingId}:`, seatReleaseError);
+          }
 
           // Notify clients using BookingGateway for booking status change
           if (booking) {
-            this.bookingGateway.notifyBookingStatusChanged(
-              payment.bookingId,
-              BookingStatus.CANCELLED,
-              {
-                paymentFailed: true,
-                paymentMethod: 'payos',
-                transactionId: orderCode.toString(),
-                reason: 'Payment failed',
-              },
-            );
+            try {
+              this.bookingGateway.notifyBookingStatusChanged(
+                payment.bookingId,
+                BookingStatus.CANCELLED,
+                {
+                  paymentFailed: true,
+                  paymentMethod: 'payos',
+                  transactionId: orderCode.toString(),
+                  reason: 'Payment failed',
+                },
+              );
+              this.logger.log(`Booking gateway notification sent for booking ${payment.bookingId} - CANCELLED status`);
+            } catch (gatewayError) {
+              this.logger.error(`Failed to send booking gateway notification for booking ${payment.bookingId}:`, gatewayError);
+            }
+          } else {
+            this.logger.warn(`Skipping booking gateway notification - booking not found for ${payment.bookingId}`);
           }
 
           // Notify clients in real-time about seat availability
-          if (seatStatuses.length > 0) {
-            const tripId = seatStatuses[0].tripId;
-            const seatIds = seatStatuses.map((seat) => seat.seatId);
+          if (seatStatuses && seatStatuses.length > 0) {
+            try {
+              const tripId = seatStatuses[0].tripId;
+              const seatIds = seatStatuses.map((seat) => seat.seatId);
 
-            this.seatStatusGateway.notifySeatsAvailable(tripId, seatIds);
+              this.seatStatusGateway.notifySeatsAvailable(tripId, seatIds);
 
-            this.logger.log(
-              `Real-time notification sent for ${seatIds.length} seats now available for trip ${tripId}`,
-            );
+              this.logger.log(
+                `Real-time notification sent for ${seatIds.length} seats now available for trip ${tripId}`,
+              );
+            } catch (seatNotificationError) {
+              this.logger.error(`Failed to send seat availability notification for booking ${payment.bookingId}:`, seatNotificationError);
+            }
+          } else {
+            this.logger.warn(`Skipping seat availability notification - no seat statuses found for booking ${payment.bookingId}`);
           }
         }
       }
@@ -415,7 +489,17 @@ export class PayosService {
         message: 'Webhook processed successfully',
       };
     } catch (error) {
-      this.logger.error('Error processing webhook', error);
+      this.logger.error('Critical error processing webhook:', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+        stack: error instanceof Error ? error.stack : undefined,
+        webhookData: {
+          orderCode: webhookData.orderCode,
+          amount: webhookData.amount,
+          code: webhookData.code,
+          desc: webhookData.desc,
+        },
+        timestamp: new Date().toISOString(),
+      });
       return {
         success: false,
         message: 'Failed to process webhook',
