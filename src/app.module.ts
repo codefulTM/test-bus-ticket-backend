@@ -34,9 +34,6 @@ import { PayosModule } from './payos/payos.module';
       useFactory: (configService: ConfigService) =>
         databaseConfig(configService),
       inject: [ConfigService],
-      ssl: {
-        rejectUnauthorized: false,
-      },
     }),
     AuthModule,
     AdminModule,
